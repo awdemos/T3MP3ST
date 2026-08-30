@@ -418,12 +418,66 @@ function agentFailureOutput(output: string): string | null {
   const text = output.trim();
   if (/^API call failed\b/i.test(text)) return text.slice(0, 300);
   if (/connection error/i.test(text) && /failed/i.test(text)) return text.slice(0, 300);
+  // opencode (a Bun standalone) can exit 0 having printed only its startup
+  // chrome — the "Hello via Bun!" line — when the backend hiccups. That is a
+  // failed call, not content; reject so the backbone's retry ladder fires.
+  const stripped = text
+    .replace(/\x1b\[[0-9;]*m/g, '')
+    .replace(/^Hello via Bun!\s*/i, '')
+    .trim();
+  if (stripped === '') {
+    return 'local agent produced no content (startup banner only) — backend hiccup';
+  }
   return null;
 }
 
 function envTimeoutMs(name: string, fallback: number): number {
   const parsed = Number(process.env[name]);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+interface OpencodeJsonResult {
+  content: string;
+  /** finish reason of the last step_finish event, if any (e.g. 'stop', 'length'). */
+  finishReason?: string;
+  /** provider/API error surfaced as an error event (e.g. 401 Invalid Authentication). */
+  error?: string;
+}
+
+/**
+ * Parse the JSONL event stream from `opencode run --format json`. The reply text is the
+ * concatenated `text` parts of the LAST assistant message (earlier messages are tool-call
+ * commentary). Non-JSON lines (the "Hello via Bun!" startup banner) are skipped. Returns
+ * null when no events parsed at all (older CLI without --format json) so the caller can
+ * fall back to the raw stdout.
+ */
+function parseOpencodeJsonEvents(raw: string): OpencodeJsonResult | null {
+  const textByMessage = new Map<string, string[]>();
+  let lastMessageId: string | null = null;
+  let finishReason: string | undefined;
+  let error: string | undefined;
+  let sawEvent = false;
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t.startsWith('{')) continue;
+    let ev: { type?: string; part?: { messageID?: string; text?: string; reason?: string }; error?: { name?: string; data?: { message?: string } } };
+    try { ev = JSON.parse(t); } catch { continue; }
+    sawEvent = true;
+    if (ev.type === 'text' && typeof ev.part?.text === 'string') {
+      const mid = ev.part.messageID || '';
+      lastMessageId = mid;
+      const arr = textByMessage.get(mid) || [];
+      arr.push(ev.part.text);
+      textByMessage.set(mid, arr);
+    } else if (ev.type === 'step_finish') {
+      finishReason = ev.part?.reason ?? finishReason;
+    } else if (ev.type === 'error') {
+      error = ev.error?.data?.message || ev.error?.name || 'unknown opencode error';
+    }
+  }
+  if (!sawEvent) return null;
+  const content = lastMessageId !== null ? (textByMessage.get(lastMessageId) || []).join('\n').trim() : '';
+  return { content, finishReason, error };
 }
 
 /**
@@ -517,7 +571,11 @@ export function localAgentChat(id: string, prompt: string, opts: { model?: strin
     outFile = join(workDir, 'reply.txt');
     args = ['exec', '--ephemeral', '--skip-git-repo-check', '--color', 'never', '--sandbox', 'read-only', '--output-last-message', outFile, ...(model ? ['-m', model] : [])];
   } else if (id === 'opencode') {
-    args = ['run', ...(model ? ['--model', model] : [])];
+    // --format json: stdout becomes a JSONL event stream (text/step_finish/error events)
+    // instead of the formatted agent transcript — the raw transcript buries the actual
+    // reply under agent-harness chatter and makes finish-reason=length truncation
+    // invisible to the caller.
+    args = ['run', '--format', 'json', ...(model ? ['--model', model] : [])];
   } else if (id === 'omp') {
     // Piped stdin selects OMP's one-shot print mode. Its own tools stay disabled so the model may
     // request actions through T3MP3ST's text contract while Arsenal remains the execution boundary.
@@ -542,6 +600,24 @@ export function localAgentChat(id: string, prompt: string, opts: { model?: strin
     child.on('close', (code) => {
       let content = out.trim();
       if (outFile) { try { content = (readFileSync(outFile, 'utf8').trim() || content); } catch { /* fall back to stdout */ } }
+      if (id === 'opencode') {
+        const events = parseOpencodeJsonEvents(content);
+        if (events) {
+          // A reply cut off by the model's output budget is a FAILED call — returning the
+          // partial text would let a caller try to parse truncated JSON and silently get
+          // nothing. Reject so the backbone's retry/fallback ladder sees the failure.
+          if (events.finishReason === 'length') {
+            finish(() => reject(new Error('opencode reply truncated by output-token budget (finish reason: length)')));
+            return;
+          }
+          if (events.error && !events.content) {
+            const errMsg = events.error.slice(0, 300);
+            finish(() => reject(new Error(errMsg)));
+            return;
+          }
+          content = events.content;
+        }
+      }
       finish(() => {
         const semanticError = agentFailureOutput(content);
         if (code === 0 && content && !semanticError) resolve(content);
