@@ -60,15 +60,25 @@ function stripFences(s: string): string {
 function balancedSpans(s: string, open: string, close: string): string[] {
   const spans: string[] = [];
   let depth = 0, start = -1;
+  let inString = false, escaped = false;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
+    // JSON string literals may contain unmatched brackets (code snippets,
+    // prose) — skip them or the depth counter desyncs and no span parses.
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
     if (c === open) { if (depth === 0) start = i; depth++; }
     else if (c === close) { if (depth > 0 && --depth === 0 && start >= 0) { spans.push(s.slice(start, i + 1)); start = -1; } }
   }
   return spans;
 }
 
-function parseLastArray(text: string): unknown[] | null {
+export function parseLastArray(text: string): unknown[] | null {
   const s = stripFences(text);
   try { const d = JSON.parse(s.trim()); if (Array.isArray(d)) return d; } catch { /* fall through */ }
   const spans = balancedSpans(s, '[', ']');
@@ -78,7 +88,7 @@ function parseLastArray(text: string): unknown[] | null {
   return null;
 }
 
-function parseLastObject(text: string): Record<string, unknown> | null {
+export function parseLastObject(text: string): Record<string, unknown> | null {
   const s = stripFences(text);
   try { const d = JSON.parse(s.trim()); if (d && typeof d === 'object' && !Array.isArray(d)) return d as Record<string, unknown>; } catch { /* fall through */ }
   const spans = balancedSpans(s, '{', '}');
