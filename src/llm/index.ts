@@ -1529,9 +1529,12 @@ export function isLikelyRefusal(content?: string, finishReason?: string): boolea
   // cannot assist", "I won't provide", "I must decline to participate". Crucially
   // NOT "I can't find the flag" / "I cannot reach the host" (technical progress).
   const declineToHelp = /\bi\s*(?:'?m|am)?\s*(?:(?:so\s+)?sorry|afraid)?[,.: ]*\s*(?:but\s+)?(?:i\s+)?(?:can'?t|cannot|can\s?not|could\s?not|won'?t|will\s+not|am\s+not\s+able\s+to|'?m\s+not\s+able\s+to|am\s+unable\s+to|unable\s+to|not\s+able\s+to|not\s+going\s+to|must\s+decline|have\s+to\s+decline|refuse\s+to|do\s+not\s+feel\s+comfortable|don'?t\s+feel\s+comfortable)\s+(?:to\s+)?(?:further\s+)?(?:you\s+)?(?:with\s+|in\s+)?(?:help|assist|compl|provid|creat|generat|engag|participat|writ|aid|enabl|fulfil|do\s+that|do\s+this)\w*/;
+  // Role refusals: "I can't take on the role of ...", "I won't act as ...",
+  // "I cannot assume the role" — the model declines the persona, not a task.
+  const declineRole = /\bi\s*(?:'?m|am)?\s*(?:(?:so\s+)?sorry|afraid)?[,.: ]*\s*(?:but\s+)?(?:i\s+)?(?:can'?t|cannot|can\s?not|could\s?not|won'?t|will\s+not|am\s+not\s+able\s+to|'?m\s+not\s+able\s+to|unable\s+to|must\s+decline)\s+(?:to\s+)?(?:take\s+on|accept|assume|act\s+as|play|adopt)\s+(?:the\s+)?(?:role|persona|part)\b/;
   // Explicit policy / values language.
   const policyLang = /(?:against\s+(?:my|our|the)\s+(?:guidelines|policy|policies|programming|principles|values)|violat\w*[^.]{0,25}(?:polic\w*|guideline)|i'?m\s+not\s+going\s+to\s+(?:help|assist|provide)|not\s+something\s+i\s+(?:can|will)\s+(?:help|assist|do))/;
-  return declineToHelp.test(t) || policyLang.test(t);
+  return declineToHelp.test(t) || declineRole.test(t) || policyLang.test(t);
 }
 
 /**
@@ -1690,6 +1693,7 @@ export class LLMBackbone extends EventEmitter<LLMEvents> {
     let lastError: Error | null = null;
     let reframeNext = false; // honest authz restatement on the hop after a refusal
     const trail: string[] = [];
+    const reframeRetriedRungs = new Set<string>(); // bottom-rung refusals get one reframed retry in place
 
     for (let rung = 0; rung < ladder.length; rung++) {
       const hop = ladder[rung];
@@ -1720,7 +1724,10 @@ export class LLMBackbone extends EventEmitter<LLMEvents> {
           const permanent = (error instanceof LLMApiError &&
             (error.status === 401 || error.status === 403 || error.status === 404)) ||
             !!options?.signal?.aborted ||
-            (isLocalProvider && classifyErrorKind(error as Error) === 'timeout');
+            (isLocalProvider && classifyErrorKind(error as Error) === 'timeout') ||
+            // A CLI agent reply cut by the model's output-token budget truncates the SAME
+            // way on every identical retry — advance the ladder instead of re-firing.
+            (isLocalProvider && /finish reason: length/.test((error as Error).message || ''));
           if (permanent || attempt >= this.retryAttempts) break;
           let delayMs = this.retryDelayMs * Math.pow(2, attempt - 1);
           if (error instanceof LLMApiError && error.retryAfterMs) {
@@ -1757,6 +1764,16 @@ export class LLMBackbone extends EventEmitter<LLMEvents> {
         reframeNext = soft === 'refusal';
         if (hasNext) {
           this.emit('request:fallback', { fromModel: hop.model, toModel: ladder[rung + 1].model, engaged: true, reason: soft });
+          continue;
+        }
+        // bottom of the ladder: a refusal gets ONE reframed retry in place before we
+        // accept the best-effort response — with a single-rung ladder there is no next
+        // hop for `reframeNext` to apply to, so without this the reframe is wasted.
+        const rungKey = `${hop.provider}:${hop.model}`;
+        if (soft === 'refusal' && !reframeRetriedRungs.has(rungKey)) {
+          reframeRetriedRungs.add(rungKey);
+          reframeNext = true;
+          rung--; // retry the same rung with the authorized-context reframe
           continue;
         }
         // bottom of the ladder: surface the best-effort / honest response, don't throw
