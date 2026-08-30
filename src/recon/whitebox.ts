@@ -302,7 +302,11 @@ function buildDecompositionConfig(): DecompositionConfig {
   return {
     orchestratorModel,
     workerModel,
-    maxQueriesPerRound: 8,
+    // Env-tunable: each query embeds a verbatim source snippet in the response, so 8
+    // queries can overflow a CLI-agent model's output budget and truncate mid-JSON.
+    maxQueriesPerRound: Number(process.env.TEMPEST_MAX_QUERIES_PER_ROUND) > 0
+      ? Number(process.env.TEMPEST_MAX_QUERIES_PER_ROUND)
+      : 8,
     parallelWorkers: true,
   };
 }
