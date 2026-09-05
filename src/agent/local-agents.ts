@@ -421,9 +421,11 @@ function agentFailureOutput(output: string): string | null {
   // opencode (a Bun standalone) can exit 0 having printed only its startup
   // chrome — the "Hello via Bun!" line — when the backend hiccups. That is a
   // failed call, not content; reject so the backbone's retry ladder fires.
+  // Strip ANSI escape sequences (ESC + SGR codes) before deciding the output is empty.
+  const ansiEscape = new RegExp('\u001b\\[[0-9;]*m', 'gu'); // eslint-disable-line no-control-regex
   const stripped = text
-    .replace(/\x1b\[[0-9;]*m/g, '')
-    .replace(/^Hello via Bun!\s*/i, '')
+    .replace(ansiEscape, '')
+    .replace(/^Hello via Bun!\s*/iu, '')
     .trim();
   if (stripped === '') {
     return 'local agent produced no content (startup banner only) — backend hiccup';
